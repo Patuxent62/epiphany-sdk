@@ -205,6 +205,11 @@ github_tool () {
 			"https://github.com/${organization}/${repo}/archive" \
 			"tar xf" "${branch}.tar.gz" "${repo}-${branch}"
     fi
+
+    if [ ${tool} = "epiphany-libs" ]
+    then
+       rsync -ap sdk/libupdates-2021.01/epiphany-libs ./
+    fi
 }
 
 # Function that loops over all component versions and downloads them

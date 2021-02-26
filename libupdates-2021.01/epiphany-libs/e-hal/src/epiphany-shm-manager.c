@@ -1,0 +1,575 @@
+/*
+  File: epiphany-shm-manager.c
+
+  This file is part of the Epiphany Software Development Kit.
+
+  Copyright (C) 2014 Adapteva, Inc.
+  See AUTHORS for list of contributors
+  Support e-mail: <support@adapteva.com>
+
+  This program is free software: you can redistribute it and/or modify
+  it under the terms of the GNU Lesser General Public License (LGPL)
+  as published by the Free Software Foundation, either version 3 of the
+  License, or (at your option) any later version.
+
+  This program is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.	See the
+  GNU General Public License for more details.
+
+  You should have received a copy of the GNU General Public License
+  and the GNU Lesser General Public License along with this program,
+  see the files COPYING and COPYING.LESSER.	 If not, see
+  <http://www.gnu.org/licenses/>.
+*/
+
+#include <stdint.h>
+#include <sys/types.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <string.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <err.h>
+#include <assert.h>
+#include <stdio.h>
+#include <unistd.h>
+#include "epiphany.h"
+#include <memman.h>
+
+#include "epiphany-hal.h"
+#include "epiphany-hal-api-local.h"
+#include "epiphany-shm-manager.h"
+
+#include "esim-target.h"
+
+typedef unsigned long long ulong64;
+
+static e_shmtable_t    *shm_table        = 0;
+static size_t           shm_table_length = 0;
+static int              epiphany_devfd   = -1;
+static epiphany_alloc_t shm_alloc        = { 0 };
+
+static e_shmseg_pvt_t* shm_lookup_region(e_shmtable_t *tbl, const char *name);
+static e_shmseg_pvt_t* shm_alloc_region(e_shmtable_t *tbl, const char *name, size_t size);
+static int shm_table_sanity_check(e_shmtable_t *tbl);
+static void dump_shm_table(e_shmtable_t *tbl, bool only_valid);
+
+
+e_shmtable_t *e_shm_get_shmtable();
+int e_shm_put_shmtable();
+
+extern e_platform_t e_platform;
+extern int	 e_host_verbose;
+#define diag(vN) if (e_host_verbose >= vN)
+
+static int e_shm_init_esim_and_pal()
+{
+	memset(&shm_alloc, 0, sizeof(shm_alloc));
+
+	shm_alloc.size = GLOBAL_SHM_SIZE;
+	shm_alloc.flags = 0;
+	shm_alloc.bus_addr = 0x8c000000ULL + 0x01000000ULL;	/* From platform.hdf + shared_dram offset */
+	shm_alloc.phy_addr = 0x3c000000ULL + 0x01000000ULL;	/* From platform.hdf + shared_dram offset */
+	shm_alloc.kvirt_addr = 0;
+	shm_alloc.mmap_handle = shm_alloc.bus_addr;
+	shm_alloc.uvirt_addr = (unsigned long)
+		e_platform.target_ops->get_raw_pointer(shm_alloc.mmap_handle,
+											   shm_alloc.size);
+
+	shm_table_length = shm_alloc.size;
+
+	return shm_alloc.uvirt_addr != 0 ? E_OK : E_ERR;
+}
+
+int e_shm_init_native()
+{
+	int              devfd       = 0;
+	e_memseg_t       *emem;
+
+	diag(H_D2) { fprintf(stderr, "e_shm_init_native(): Entry\n"); }
+	/* Map the epiphany global shared memory into process address space */
+	devfd = open(EPIPHANY_DEV, O_RDWR | O_SYNC);
+	if ( -1 == devfd ) {
+		warnx("e_shm_init_native(): EPIPHANY_DEV file open failure.");
+		return E_ERR;
+	}
+
+	if (!e_platform.num_emems) {
+		warnx("e_shm_init_native(): No memory regions.");
+		return E_ERR;
+	}
+	emem = &e_platform.emem[0];
+	shm_alloc.size        = GLOBAL_SHM_SIZE;
+	shm_alloc.bus_addr    = emem->ephy_base + 0x01000000; /* + shared_dram offset */
+	shm_alloc.phy_addr    = emem->phy_base  + 0x01000000; /* + shared_dram offset */
+	shm_alloc.kvirt_addr  = 0;
+	shm_alloc.mmap_handle = shm_alloc.bus_addr;
+	diag(H_D2) { fprintf(stderr, "e_shm_init_native(): shm_alloc.size = 0x%08llx\n", shm_alloc.size); }
+	diag(H_D2) { fprintf(stderr, "e_shm_init_native(): shm_alloc.bus_addr = 0x%08llx\n", shm_alloc.bus_addr); }
+	diag(H_D2) { fprintf(stderr, "e_shm_init_native(): shm_alloc.phy_addr = 0x%08llx\n", shm_alloc.phy_addr); }
+	diag(H_D2) { fprintf(stderr, "e_shm_init_native(): shm_alloc.kvirt_addr = 0x%08llx\n", shm_alloc.kvirt_addr); }
+	diag(H_D2) { fprintf(stderr, "e_shm_init_native(): shm_alloc.mmap_handle = 0x%08llx\n", shm_alloc.mmap_handle); }
+
+	shm_table_length = shm_alloc.size;
+
+	shm_alloc.uvirt_addr = (unsigned long)mmap(0, shm_alloc.size,
+		PROT_READ|PROT_WRITE, MAP_SHARED, devfd, (off_t)shm_alloc.mmap_handle);
+	if ( MAP_FAILED == (void*)shm_alloc.uvirt_addr ) {
+		warnx("e_shm_init_native(): Failed to map global shared memory. Error is %s",
+			  strerror(errno));
+
+		close(devfd);
+		return E_ERR;
+	}
+	diag(H_D2) { fprintf(stderr, "e_shm_init_native(): shm_alloc.uvirt_addr = 0x%08llx\n", shm_alloc.uvirt_addr); }
+
+	epiphany_devfd = devfd;
+
+	diag(H_D2) { fprintf(stderr, "e_shm_init_native(): Exit\n"); }
+	return E_OK;
+}
+
+/**
+ * Initialize the shared memory manager.
+ */
+int e_shm_init()
+{
+	uintptr_t heap = 0;
+	size_t heap_length = 0;
+	int rc;
+	e_shmtable_t *tbl;
+
+	diag(H_D2) { fprintf(stderr, "e_shm_init(): Entry\n"); }
+	if (ee_native_target_p())
+		rc = e_shm_init_native();
+	else
+		rc = e_shm_init_esim_and_pal();
+
+	if (rc != E_OK) {
+		warnx("e_shm_init(): Failed");
+		return E_ERR;
+	}
+
+	diag(H_D2) { fprintf(stderr, "e_shm_init(): mapped shm: handle 0x%08lx, "
+						 "uvirt 0x%08lx, size 0x%08lx\n", shm_alloc.mmap_handle,
+						 shm_alloc.uvirt_addr, shm_alloc.size); }
+
+	/** The shm table is initialized by the Epiphany driver. */
+	shm_table = (e_shmtable_t*)shm_alloc.uvirt_addr;
+
+
+	// Enter critical section
+	tbl = e_shm_get_shmtable();
+	if ( !tbl )
+		return E_ERR;
+	diag(H_D2) { dump_shm_table(shm_table, false); }
+
+	/* Check whether we have a working SHM table and if not reset it */
+	if ( E_OK != shm_table_sanity_check(shm_table) ) {
+		if (shm_table->initialized) {
+			diag(H_D1) {
+				fprintf(stderr, "e_shm_init(): SHM table was "
+						"corrupted. Will reset it.\n");
+			}
+		}
+
+		memset((void *) shm_table, 0, sizeof(*shm_table));
+		shm_table->magic      = SHM_MAGIC;
+		shm_table->paddr_epi  = shm_alloc.bus_addr;
+		shm_table->paddr_cpu  = shm_alloc.phy_addr;
+
+		shm_table->initialized = 1;
+		diag(H_D1) { fprintf(stderr, "e_shm_init(): SHM table was reset.\n"); }
+        diag(H_D1) { dump_shm_table(shm_table, false); }
+	}
+
+	/* Finally, calculate heap base and heap size and initialize memory
+	 * manager */
+	heap = shm_alloc.uvirt_addr + sizeof(*shm_table);
+	heap_length = GLOBAL_SHM_SIZE - (heap - shm_alloc.uvirt_addr);
+
+	diag(H_D1) { fprintf(stderr, "e_shm_init(): initializing memory manager."
+						 " Heap addr is 0x%08llx, length is 0x%08llx\n",
+						 (ulong64) heap, (ulong64) heap_length); }
+
+	memman_init((void*)heap, heap_length);
+
+
+	if ( E_OK != e_shm_put_shmtable() )
+		return E_ERR;
+
+	diag(H_D2) { fprintf(stderr, "e_shm_init(): Standard Exit\n"); }
+	return E_OK;
+}
+
+void e_shm_finalize(void)
+{
+	if (!ee_esim_target_p())
+		munmap((void*)shm_table, shm_table_length);
+	diag(H_D2) { fprintf(stderr, "e_shm_finalize(): teardown complete\n"); }
+}
+
+int e_shm_alloc(e_mem_t *mbuf, const char *name, size_t size)
+{
+	e_shmtable_t   *tbl	   = NULL;
+	e_shmseg_pvt_t *region = NULL;
+	int				retval = E_ERR;
+
+	diag(H_D2) { fprintf(stderr, "e_shm_alloc(): Entry\n"); }
+	if ( !mbuf || !name || !size ) {
+		errno = EINVAL;
+		goto err2;
+	}
+
+	// Enter critical section
+	tbl = e_shm_get_shmtable();
+	if ( !tbl )
+		goto err2;
+
+	if ( E_OK != shm_table_sanity_check(tbl) ) {
+		errno = EINVAL;
+		goto err1;
+	}
+
+	if ( shm_lookup_region(tbl, name) ) {
+		errno = EEXIST;
+		goto err1;
+	}
+
+	diag(H_D4) { fprintf(stderr, "e_shm_alloc(): Table before allocation:\n"); }
+	diag(H_D4) { dump_shm_table(tbl, true); }
+	diag(H_D2) { fprintf(stderr, "e_shm_alloc(): alloc request for 0x%08x "
+						 "bytes named %s\n", size, name); }
+
+	region = shm_alloc_region(tbl, name, size);
+	if ( region ) {
+		region->valid = 1;
+		region->refcnt = 1;
+
+		mbuf->objtype = E_SHARED_MEM;
+		mbuf->memfd = epiphany_devfd;
+		mbuf->phy_base = tbl->paddr_cpu;
+		mbuf->ephy_base = tbl->paddr_epi;
+		mbuf->page_base = 0; // Not used for shared memory regions
+		mbuf->page_offset = region->shm_seg.offset;
+		mbuf->map_size = region->shm_seg.size;
+		mbuf->mapped_base = ((char*)(tbl));
+		mbuf->base = mbuf->mapped_base + mbuf->page_offset;
+		mbuf->emap_size = region->shm_seg.size;
+		mbuf->priv = e_platform.priv;
+		retval = e_platform.target_ops->shm_alloc(mbuf);
+	} else {
+		diag(H_D1) { fprintf(stderr, "e_shm_alloc(): alloc request for 0x%08x "
+							 "bytes named %s failed\n", size, name); }
+
+		errno = ENOMEM;
+	}
+	diag(H_D3) { fprintf(stderr, "e_shm_alloc(): Table after allocation:\n"); }
+	diag(H_D3) { dump_shm_table(tbl, true); }
+
+ err1:
+	// Exit critical section
+	diag(H_D2) { fprintf(stderr, "e_shm_alloc(): Standard Exit\n"); }
+	if ( E_OK != e_shm_put_shmtable() )
+		retval = E_ERR;
+
+ err2:
+	return retval;
+}
+
+int e_shm_attach(e_mem_t *mbuf, const char *name)
+{
+	e_shmtable_t   *tbl	   = NULL;
+	e_shmseg_pvt_t *region = NULL;
+	int				retval = E_ERR;
+
+	diag(H_D2) { fprintf(stderr, "e_shm_attach(): Entry\n"); }
+	if ( !mbuf || !name ) {
+        diag(H_D1) { fprintf(stderr, "e_shm_attach(): Failed input pointer check\n"); }
+		return E_ERR;
+	}
+
+	// Enter critical section
+	tbl = e_shm_get_shmtable();
+	if ( !tbl )
+	{
+        diag(H_D1) { fprintf(stderr, "e_shm_attach(): Unable to lock shm table\n"); }
+		return E_ERR;
+	}
+
+	if ( E_OK != shm_table_sanity_check(tbl) ) {
+        diag(H_D1) { fprintf(stderr, "e_shm_attach(): Shm table failed sanity check\n"); }
+		retval = E_ERR;
+		goto err;
+	}
+
+	region = shm_lookup_region(tbl, name);
+	if ( region ) {
+        diag(H_D2) { fprintf(stderr, "e_shm_attach(): Region found for %s\n", name); }
+        diag(H_D2) { fprintf(stderr, "   region.shm_seg.addr = 0x%08lx\n", region->shm_seg.addr); }
+        diag(H_D2) { fprintf(stderr, "   region.shm_seg.name = 0x%s\n", region->shm_seg.name); }
+        diag(H_D2) { fprintf(stderr, "   region.shm_seg.offset = 0x%08llx\n", region->shm_seg.offset); }
+        diag(H_D2) { fprintf(stderr, "   region.shm_seg.paddr = 0x%08lx\n", region->shm_seg.paddr); }
+        diag(H_D2) { fprintf(stderr, "   region.shm_seg.__fill1 = 0x%08llx\n", region->shm_seg.__fill1); }
+        diag(H_D2) { fprintf(stderr, "   region.shm_seg.__fill2 = 0x%08llx\n", region->shm_seg.__fill2); }
+
+		++region->refcnt;
+
+		mbuf->objtype = E_SHARED_MEM;
+		mbuf->memfd = epiphany_devfd;
+		mbuf->phy_base = tbl->paddr_cpu + sizeof(*tbl);
+		mbuf->ephy_base = tbl->paddr_epi + sizeof(*tbl);
+		mbuf->page_base = 0; // Not used ??
+		mbuf->page_offset = region->shm_seg.offset;
+		mbuf->map_size = region->shm_seg.size;
+		mbuf->mapped_base = ((char*)(tbl));
+		mbuf->base = mbuf->mapped_base + mbuf->page_offset;
+		mbuf->emap_size = region->shm_seg.size;
+
+		retval = e_platform.target_ops->shm_alloc(mbuf);
+	}
+
+ err:
+	// Exit critical section
+	if ( E_OK != e_shm_put_shmtable() )
+		return E_ERR;
+
+	diag(H_D2) { fprintf(stderr, "e_shm_attach(): Standard Exit\n"); }
+	return retval;
+}
+
+int e_shm_release(const char *name)
+{
+	e_shmseg_pvt_t   *region = NULL;
+	int               retval = E_ERR;
+	e_shmtable_t *tbl;
+
+	// Enter critical section
+	tbl = e_shm_get_shmtable();
+	if ( !tbl )
+		return E_ERR;
+
+	region = shm_lookup_region(tbl, name);
+
+	if ( region ) {
+		if ( 0 == --region->refcnt ) {
+			region->valid = 0;
+			memman_free(region->shm_seg.addr);
+		}
+		retval = E_OK;
+	}
+
+	// Exit critical section
+	if ( E_OK != e_shm_put_shmtable() )
+		return E_ERR;
+
+	return retval;
+}
+
+
+/**
+ * Dump the shm table to stderr for debugging.
+ *
+ * WARNING: The caller should hold the shm table lock when
+ * calling this function.
+ */
+static void dump_shm_table(e_shmtable_t *tbl, bool only_valid)
+{
+	int i = 0;
+
+	fprintf(stderr, "e_dump_shm_table(): Enter\n");
+	fprintf(stderr, "--------------------------------------------------------------------\n");
+	fprintf(stderr, "table address = 0x%08lx\n", tbl);
+	fprintf(stderr, "table->magic = 0x%08lx\n", tbl->magic);
+	fprintf(stderr, "table->paddr_epi = 0x%08llx\n", tbl->paddr_epi);
+	fprintf(stderr, "table->paddr_cpu = 0x%08llx\n", tbl->paddr_cpu);
+	fprintf(stderr, "table->free_space = 0x%08llx\n", tbl->free_space);
+	fprintf(stderr, "+++++++++++++Regions++++++++++++\n");
+	for ( i = 0; i < MAX_SHM_REGIONS; ++i )
+	{
+        if (only_valid == true)
+            fprintf(stderr, "table->regions[%d].valid = %d\n", i, tbl->regions[i].valid);
+        if ( tbl->regions[i].valid )
+        {
+            fprintf(stderr, "region %d is valid so region data follows:\n", i, tbl->regions[i].valid);
+            fprintf(stderr, "   table->regions[%d].shm_seg.addr = 0x%08lx\n", i, tbl->regions[i].shm_seg.addr);
+            fprintf(stderr, "   table->regions[%d].shm_seg.name = 0x%s\n", i, tbl->regions[i].shm_seg.name);
+            fprintf(stderr, "   table->regions[%d].shm_seg.offset = 0x%08llx\n", i, tbl->regions[i].shm_seg.offset);
+            fprintf(stderr, "   table->regions[%d].shm_seg.paddr = 0x%08lx\n", i, tbl->regions[i].shm_seg.paddr);
+            fprintf(stderr, "   table->regions[%d].shm_seg.__fill1 = 0x%08llx\n", i, tbl->regions[i].shm_seg.__fill1);
+            fprintf(stderr, "   table->regions[%d].shm_seg.__fill2 = 0x%08llx\n", i, tbl->regions[i].shm_seg.__fill2);
+        }
+	}
+	fprintf(stderr, "++++++++++++++++++++++++++++++++\n");
+	fprintf(stderr, "--------------------------------------------------------------------\n");
+	fprintf(stderr, "e_dump_shm_table(): Exit\n");
+    return;
+}
+
+/**
+ * Search the shm table for a region named by name.
+ *
+ * WARNING: The caller should hold the shm table lock when
+ * calling this function.
+ */
+static e_shmseg_pvt_t*
+shm_lookup_region(e_shmtable_t *tbl, const char *name)
+{
+	e_shmseg_pvt_t   *retval = NULL;
+	int               i      = 0;
+
+	for ( i = 0; i < MAX_SHM_REGIONS; ++i ) {
+		if ( tbl->regions[i].valid &&
+			 !strcmp(name, tbl->regions[i].shm_seg.name) ) {
+			retval = &tbl->regions[i];
+			break;
+		}
+	}
+
+	return retval;
+}
+
+/**
+ * Search the shm table for a region named by name.
+ *
+ * WARNING: The caller should hold the shm table lock when
+ * calling this function.
+ */
+static e_shmseg_pvt_t*
+shm_alloc_region(e_shmtable_t *tbl, const char *name, size_t size)
+{
+	e_shmseg_pvt_t   *region = NULL;
+	int               i      = 0;
+
+	for ( i = 0; i < MAX_SHM_REGIONS; ++i ) {
+		if ( !tbl->regions[i].valid ) {
+
+			region = &tbl->regions[i];
+			strncpy(region->shm_seg.name, name, sizeof(region->shm_seg.name));
+
+			region->shm_seg.addr = memman_alloc(size);
+			if ( !region->shm_seg.addr ) {
+				/* Allocation failed */
+				diag(H_D1) { fprintf(stderr, "shm_alloc_region(): alloc request for 0x%08x "
+									 "bytes named %s failed\n", size, name); }
+
+				region = NULL;
+				break;
+			}
+
+			/*
+			 * Note: the shm heap follows the shm table in memory.
+			 */
+			region->shm_seg.offset = ((char*)region->shm_seg.addr) -
+				((char*)tbl);
+
+			region->shm_seg.paddr = ((char*)(uintptr_t)tbl->paddr_epi) +
+				region->shm_seg.offset;
+
+			region->shm_seg.size = size;
+
+			tbl->regions[i].valid = 1;
+
+			diag(H_D1) {
+				fprintf(stderr, "e_hal::shm_alloc_region(): allocated shm "
+						"region: name %s, addr 0x%08lx, paddr 0x%08lx, "
+						"offset 0x%08x, size 0x%08x\n", region->shm_seg.name,
+						(unsigned long)region->shm_seg.addr,
+						(unsigned long)region->shm_seg.paddr,
+						(unsigned)region->shm_seg.offset,
+						(unsigned)region->shm_seg.size);
+			}
+
+			break;
+		}
+	}
+
+	return region;
+}
+
+/**
+ * Sanity-check the shm table
+ *
+ * WARNING: The caller should hold the shm table lock when
+ * calling this function.
+ */
+static int shm_table_sanity_check(e_shmtable_t *tbl)
+{
+	diag(H_D2) { fprintf(stderr, "shm_table_sanity_check(): Entry\n"); }
+	if ( !tbl ) {
+		assert(!"Global shm table is NULL, did you forget to call"
+			   " e_shm_init()?");
+		return E_ERR;
+	}
+
+	if ( !tbl->initialized ) {
+		diag(H_D1) {
+			fprintf(stderr, "shm_table_sanity_check(): shm table "
+					"is not initialized.\n");
+		}
+		return E_ERR;
+	}
+
+	if ( tbl->magic != SHM_MAGIC ) {
+		diag(H_D1) {
+			fprintf(stderr, "shm_table_sanity_check(): Bad shm "
+					"magic. Expected 0x%08x found 0x%08x\n",
+					SHM_MAGIC, tbl->magic);
+		}
+		return E_ERR;
+	}
+
+	diag(H_D2) { fprintf(stderr, "shm_table_sanity_check(): Exit-Standard\n"); }
+	return E_OK;
+}
+
+
+
+/**
+ * The belows two functions provide mutual exclusion to the
+ * SHM table.
+ *
+ * lockf() is good for simple things like these, but if we ever need more
+ * advanced locking features we might have to resort to fcntl().
+ */
+
+e_shmtable_t *e_shm_get_shmtable()
+{
+	if (!shm_table) {
+		if ( E_OK != e_shm_init() ) {
+			warnx("e_init(): Failed to initialize the Epiphany Shared Memory Manager.");
+			return NULL;
+		}
+	}
+
+	/* TODO: Add locking support for ESIM / PAL target */
+	if (!ee_native_target_p())
+		return shm_table;
+
+	diag(H_D3) { fprintf(stderr, "e_shm_get_shmtable(): Taking lock...\n"); }
+	if ( lockf(epiphany_devfd, F_LOCK, 0) ) {
+		warnx("%s(): Failed to lock shared memory. Error is %s",
+				__func__, strerror(errno));
+		return NULL;
+	}
+	diag(H_D3) { fprintf(stderr, "e_shm_get_shmtable(): Lock acquired.\n"); }
+
+	return shm_table;
+}
+
+int e_shm_put_shmtable()
+{
+	/* TODO: Add locking support for ESIM / PAL target */
+	if (!ee_native_target_p())
+		return E_OK;
+
+	if ( lockf(epiphany_devfd, F_ULOCK, 0) ) {
+		warnx("%s(): Failed to unlock shared memory. Error is %s",
+				__func__, strerror(errno));
+		return E_ERR;
+	}
+	return E_OK;
+}

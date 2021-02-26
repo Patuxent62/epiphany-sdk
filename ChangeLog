@@ -1,3 +1,11 @@
+2021-02-25  Cam Russell   <patuxententerprises@gmail.com>
+        - Added the libupdates-2021.01 directories to hold updates to be applied
+          to the SDK after pulling from GitHub
+        - libupdates-2021.01 contains a few superficial changes to the SDK to provide
+          debugging info, otherwise functionally the SDK is not changed
+        * download-components.sh: Added ability to the github_tool function to rsync
+          libupdates-2021.01 directory contents to the epiphany-libs source directory
+
 2019-09-25  Ola Jeppsson  <ola@adapteva.com>
 
 	* build-epiphany-sdk.sh: Detect errors when copying files.
